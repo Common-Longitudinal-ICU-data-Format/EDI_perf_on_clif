@@ -1,86 +1,150 @@
-# *CLIF Project Title*
+# EDI Performance on CLIF
 
-> [!NOTE]
-> **Building a project from this template?** Read the
-> [Project Creator Guide](guides/creator-guide.md) first, then **delete this note** and customize the
-> sections below to describe your project for the consortium sites that will run it.
-
-## CLIF VERSION
-
-[major].[minor]
+This project evaluates Epic Deterioration Index (EDI) performance against adverse clinical outcomes using CLIF-formatted data. It is intended to run at any CLIF site by updating the local configuration file to point to that site's data and EDI score file.
 
 ## Objective
 
-*Describe the project objective*
+Measure EDI performance in eligible adult hospitalizations with at least one EDI score recorded between hospital arrival and discharge. The analysis estimates performance for:
 
-## Required CLIF tables and fields
+1. ICU transfer.
+2. Vasopressor initiation.
+3. Invasive mechanical ventilation.
+4. 30-day mortality.
+5. Composite adverse outcome, defined as any of the above.
 
-Please refer to the [CLIF data dictionary](https://clif-icu.com/data-dictionary), [CLIF Tools](https://clif-icu.com/tools), [ETL Guide](https://clif-icu.com/etl-guide), and [specific table contacts](https://github.com/clif-consortium/CLIF?tab=readme-ov-file#relational-clif) for more information on constructing the required tables and fields.
+## Required Data
 
-*List all required tables for the project here, and provide a brief rationale for why they are required.*
+Place the required input files in the directory configured by `data_directory` in `config/config.json`. Files may be Parquet or CSV, but `filetype` in the config must match the CLIF table extension.
+
+Required CLIF tables:
+
+1. `clif_hospitalization.{filetype}` with `patient_id`, `hospitalization_id`, `admission_dttm`, `discharge_dttm`, `age_at_admission`, `discharge_category`.
+2. `clif_patient.{filetype}` with `patient_id`, `death_dttm`, `sex_category`, `race_category`, `ethnicity_category`.
+3. `clif_adt.{filetype}` with `hospitalization_id`, `in_dttm`, `out_dttm`, `location_category`.
+4. `clif_respiratory_support.{filetype}` with `hospitalization_id`, `recorded_dttm`, `device_category`.
+5. `clif_medication_admin_continuous.{filetype}` with `hospitalization_id`, `admin_dttm`, `med_group`.
+
+Required EDI score data:
+
+1. One EDI score file, configured by `score_file` in `config/config.json`.
+2. A hospitalization or encounter identifier column, configured by `score_hospitalization_id_column`.
+3. A score timestamp column, configured by `score_time_column`.
+4. A numeric EDI score column, configured by `score_value_column`.
+
+If your EDI scores are in `clif_scores.{filetype}`, configure those columns directly. If your site stores EDI scores in a separate local file, set `score_file` to that file name or absolute path and map the relevant columns in `config/config.json`.
+
+## Configuration
+
+Create a local config file from the template:
+
+```bash
+cp config/config_template.json config/config.json
+```
+
+Edit `config/config.json` for your site. This file is ignored by git because it contains site-local paths.
 
 Example:
-The following tables are required:
-1. **patient**: `patient_id`, `race_category`, `ethnicity_category`, `sex_category`
-2. **hospitalization**: `patient_id`, `hospitalization_id`, `admission_dttm`, `discharge_dttm`, `age_at_admission`
-3. **vitals**: `hospitalization_id`, `recorded_dttm`, `vital_category`, `vital_value`
-   - `vital_category` = 'heart_rate', 'resp_rate', 'sbp', 'dbp', 'map', 'resp_rate', 'spo2'
-4. **labs**: `hospitalization_id`, `lab_result_dttm`, `lab_category`, `lab_value`
-   - `lab_category` = 'lactate'
-5. **medication_admin_continuous**: `hospitalization_id`, `admin_dttm`, `med_name`, `med_category`, `med_dose`, `med_dose_unit`
-   - `med_category` = "norepinephrine", "epinephrine", "phenylephrine", "vasopressin", "dopamine", "angiotensin", "nicardipine", "nitroprusside", "clevidipine", "cisatracurium"
-6. **respiratory_support**: `hospitalization_id`, `recorded_dttm`, `device_category`, `mode_category`, `tracheostomy`, `fio2_set`, `lpm_set`, `resp_rate_set`, `peep_set`, `resp_rate_obs`
 
-For Python users, the [clifpy](https://common-longitudinal-icu-data-format.github.io/clifpy/) package provides essential utilities for working with CLIF data, including:
-- Key features: outlier handling, encounter stitching, wide data creation, and more
-- Advanced features: SOFA score computation, respiratory support waterfall, medication unit conversion, and more
-
-See the [clifpy user guide](https://common-longitudinal-icu-data-format.github.io/clifpy/user-guide/) for detailed documentation.
-
-## Cohort identification
-*Describe study cohort inclusion and exclusion criteria here*
-
-## Expected Results
-
-*Describe the output of the analysis. The final project results should be saved in the [`output/final_no_phi`](output/README.md) directory.*
-
-> [!WARNING]
-> **Never upload patient-level data to Box.** Only **aggregate** results may be placed in
-> [`output/final_no_phi/`](output/README.md) and shared with the project PI / consortium:
-> - No `patient_id` or any row-level / individual patient records.
-> - Minimum cell size **n ≥ 10** for every reported statistic (prevents re-identification).
-> - No raw `.csv` / `.parquet` data files.
->
-> See [`output/README.md`](output/README.md) for the file-naming convention and
-> [`guides/primer.md`](guides/primer.md) for the full data-security rules.
-
-## Detailed Instructions for running the project
-
-### 1. Configure `config/config.json`
-Follow the instructions in [`config/README.md`](config/README.md) to set your site name, the path to
-your CLIF tables, and the file type. You can add any other project specific common config requirements.
-
-
-### 2. Set up the project environment
-
-Set up the environment for the language(s) this project uses.
-
-**Python (using uv):** install [uv](https://docs.astral.sh/uv/getting-started/installation/), then from
-the project root install the project's dependencies:
+```json
+{
+  "site_name": "your_site",
+  "data_directory": "/path/to/your/clif/data",
+  "filetype": "parquet",
+  "timezone": "US/Eastern",
+  "output_directory": "./output",
+  "score_file": "clif_scores.parquet",
+  "score_hospitalization_id_column": "hospitalization_id",
+  "score_time_column": "recorded_dttm",
+  "score_value_column": "score_value",
+  "edi_model_id": "30434503",
+  "edi_threshold": 40,
+  "minimum_cell_size": 10
+}
 ```
-uv sync
+
+Config fields:
+
+1. `site_name`: Short site label used in output file names.
+2. `data_directory`: Directory containing the CLIF tables and, if relative, the configured score file.
+3. `filetype`: `parquet` or `csv` for CLIF tables.
+4. `timezone`: Site timezone. This is retained for compatibility with CLIF tooling.
+5. `output_directory`: Directory where project outputs are written.
+6. `score_file`: EDI score file name relative to `data_directory`, or an absolute path.
+7. `score_hospitalization_id_column`: Score-file column that maps to CLIF `hospitalization_id`.
+8. `score_time_column`: Score-file timestamp column.
+9. `score_value_column`: Score-file numeric EDI value column.
+10. `edi_model_id`: Optional. Used only if the score file has a `model_id` column and should be filtered to one EDI model.
+11. `edi_threshold`: Score threshold used for binary performance metrics.
+12. `minimum_cell_size`: Minimum aggregate cell size for shareable outputs.
+
+## Cohort Definition
+
+The main script applies these inclusion criteria:
+
+1. Adult hospitalization, using `age_at_admission` from `clif_hospitalization`.
+2. At least one ward location during hospitalization.
+3. First observed location is ED or ward.
+4. If the first observed location is ED, the next distinct location is not ICU or procedural/surgery.
+5. At least one EDI score recorded after admission and before discharge.
+
+Category matching is intentionally case-insensitive. The R script lower-cases CLIF category fields before matching values such as `icu`, `ward`, `ed`, `procedural`, `imv`, `expired`, and `hospice`.
+
+## How To Run
+
+Run these steps from the project root.
+
+1. Install R if it is not already available.
+
+2. Create your local config.
+
+```bash
+cp config/config_template.json config/config.json
 ```
-Run project code inside the managed environment with `uv run python code/<script>.py` (or
-`uv run jupyter lab`).
 
-**R (using renv):** run `00_renv_restore.R` in [`code/`](code) to install the project's R packages.
+3. Edit `config/config.json` so `data_directory`, `site_name`, `filetype`, and score column mappings match your site.
 
-### 3. Run code
+4. Confirm the required CLIF tables and EDI score file exist in the configured location.
 
-Detailed instructions on the code workflow are provided in the [code directory](code/README.md).
-Final results are written to [`output/final_no_phi`](output/README.md) — remember the data-security rules
-above before sharing anything.
+5. Run the analysis.
 
-## Example Repositories
-* [CLIF Variation in Ventilation](https://github.com/ingra107/clif_vent_variation) for R
-* [CLIF Eligibility for mobilization](https://github.com/kaveriC/CLIF-eligibility-for-mobilization) for Python
+```bash
+Rscript "code/001_EDI_Pref.R"
+```
+
+6. Review the console output for cohort counts and performance metrics.
+
+7. Review generated outputs under `output/`.
+
+The script uses `pacman::p_load()` to load required R packages. If packages are missing and your R environment allows installation, `pacman` can install them. If your site uses a locked-down environment, install the required packages before running the script.
+
+## Outputs
+
+Patient-level and encounter-level intermediate files are written to `output/intermediate_phi/`. These files may contain PHI or row-level data and must remain local to the site.
+
+Intermediate outputs include:
+
+1. `{site_name}_demo_outcomes.parquet`.
+2. `{site_name}_adt5.parquet`.
+3. `{site_name}_edi4.parquet`.
+4. `{site_name}_table1.parquet`.
+5. `{site_name}_fig_1_data.parquet`.
+
+Aggregate final outputs are written to `output/final_no_phi/` with the configured site prefix:
+
+1. `{site_name}_fig_1.png` and `{site_name}_fig_1_df.csv`: forest plot and aggregate performance metrics.
+2. `{site_name}_fig_2.png` and `{site_name}_fig_2_df.csv`: calibration plot and binned aggregate calibration data.
+3. `{site_name}_fig_3.png` and `{site_name}_fig_3_df.csv`: adverse-outcome overlap figure and aggregate overlap counts.
+
+Both `output/intermediate_phi/` and generated files in `output/final_no_phi/` are gitignored.
+
+## Data Security
+
+Only aggregate results should be shared outside the site.
+
+1. Do not share `output/intermediate_phi/` files.
+2. Do not include `patient_id`, `hospitalization_id`, or row-level records in shared outputs.
+3. Do not share raw CLIF `.csv` or `.parquet` data files.
+4. Suppress or withhold aggregate cells with `n < minimum_cell_size`.
+5. Keep site-local configs and data paths out of committed shared artifacts.
+
+See `output/README.md` and `guides/primer.md` for broader CLIF project data-security guidance.

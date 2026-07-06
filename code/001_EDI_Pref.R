@@ -6,6 +6,74 @@
 library(pacman)
 p_load(dplyr, tidyverse, haven, lubridate, rio, ggplot2, tidyr, caret, pROC, Metrics, ggtern, survival, timeROC, forecast, mgcv, ggridges, ggplot2, broom, binom, boot, tibble, arrow, ggVennDiagram)
 
+source("utils/config.R")
+
+config_value <- function(name, default = NULL) {
+  value <- config[[name]]
+  if (is.null(value) || length(value) == 0) return(default)
+  value
+}
+
+data_directory <- config_value("data_directory")
+filetype <- config_value("filetype", "parquet")
+site_name <- config_value("site_name", "site")
+output_directory <- config_value("output_directory", "./output")
+intermediate_output_directory <- file.path(output_directory, "intermediate_phi")
+final_output_directory <- file.path(output_directory, "final_no_phi")
+dir.create(intermediate_output_directory, showWarnings = FALSE, recursive = TRUE)
+dir.create(final_output_directory, showWarnings = FALSE, recursive = TRUE)
+
+read_project_file <- function(path) {
+  if (!file.exists(path)) stop("Missing required input file: ", path)
+
+  ext <- tolower(tools::file_ext(path))
+  if (ext == "parquet") {
+    read_parquet(path)
+  } else if (ext == "csv") {
+    read_csv(path, show_col_types = FALSE)
+  } else {
+    stop("Unsupported filetype for input file: ", path)
+  }
+}
+
+read_clif_table <- function(name) {
+  read_project_file(file.path(data_directory, paste0("clif_", name, ".", filetype)))
+}
+
+lower_category_fields <- function(data) {
+  category_cols <- grep("_category$", names(data), value = TRUE)
+  category_cols <- union(category_cols, intersect("med_group", names(data)))
+
+  if (length(category_cols) == 0) return(data)
+  data %>% mutate(across(all_of(category_cols), ~ str_to_lower(as.character(.x))))
+}
+
+score_file <- config_value("score_file", paste0("clif_scores.", filetype))
+score_path <- if (grepl("^/", score_file)) score_file else file.path(data_directory, score_file)
+score_hospitalization_id_column <- config_value("score_hospitalization_id_column", "hospitalization_id")
+score_time_column <- config_value("score_time_column", "recorded_dttm")
+score_value_column <- config_value("score_value_column", "score_value")
+threshold <- as.numeric(config_value("edi_threshold", 40))
+minimum_cell_size <- as.numeric(config_value("minimum_cell_size", 10))
+
+standardize_edi_scores <- function(data) {
+  required_score_cols <- c(score_hospitalization_id_column, score_time_column, score_value_column)
+  missing_score_cols <- setdiff(required_score_cols, names(data))
+  if (length(missing_score_cols) > 0) {
+    stop("Missing configured EDI score column(s): ", paste(missing_score_cols, collapse = ", "))
+  }
+
+  if (!is.null(config[["edi_model_id"]]) && "model_id" %in% names(data)) {
+    data <- data %>% filter(as.character(model_id) == as.character(config[["edi_model_id"]]))
+  }
+
+  data %>%
+    transmute(
+      hospitalization_id = as.character(.data[[score_hospitalization_id_column]]),
+      recorded_dttm = .data[[score_time_column]],
+      score_value = as.numeric(.data[[score_value_column]]))
+}
+
 
 # ****** COHORT INCLUSION CRITERIA *******
   # Age >=18 at time of admission (already accounted for in CLIF)
@@ -50,27 +118,34 @@ p_load(dplyr, tidyverse, haven, lubridate, rio, ggplot2, tidyr, caret, pROC, Met
 # 1.) IMPORT/CLEAN DATA
 
 # ** HOSPITALIZATION INFO ** = clif_adt
-hosp <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Emory CLIF Data/clif_hospitalization.parquet") %>% 
-  select(patient_id, hospitalization_id, admission_dttm, discharge_dttm, age_at_admission, discharge_category) 
+hosp <- read_clif_table("hospitalization") %>%
+  lower_category_fields() %>%
+  select(patient_id, hospitalization_id, admission_dttm, discharge_dttm, age_at_admission, discharge_category) %>%
+  mutate(patient_id = as.character(patient_id),
+         hospitalization_id = as.character(hospitalization_id))
 
 
 # ** DEMOGRAPHICS ** = clif_patient 
-patient <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Emory CLIF Data/clif_patient.parquet") %>% 
-  select(patient_id, death_dttm, sex_category, race_category, ethnicity_category)
+patient <- read_clif_table("patient") %>%
+  lower_category_fields() %>%
+  select(patient_id, death_dttm, sex_category, race_category, ethnicity_category) %>%
+  mutate(patient_id = as.character(patient_id))
 
 demo <- hosp %>%
   select(patient_id, hospitalization_id, age_at_admission) %>%
   inner_join(patient %>% select(-death_dttm), by = "patient_id") %>%
-  mutate(race_category_clean = case_when(race_category %in% c("American Indian or Alaska Native",
-                                                              "Native Hawaiian or Other Pacific Islander",
-                                                              "Other") ~ "Other/Multiracial", 
-                                         TRUE ~ race_category)) %>%
+  mutate(race_category_clean = case_when(race_category %in% c("american indian or alaska native",
+                                                              "native hawaiian or other pacific islander",
+                                                              "other") ~ "other/multiracial",
+                                          TRUE ~ race_category)) %>%
   distinct()
 
 
 # ** OUTCOMES **
 #icu
-icu <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Emory CLIF Data/clif_adt.parquet") %>%
+icu <- read_clif_table("adt") %>%
+  lower_category_fields() %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
   filter(location_category == "icu") %>%
   group_by(hospitalization_id) %>%
   summarize(
@@ -80,13 +155,17 @@ icu <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversit
     .groups = "drop")
 
 #ventilator 
-vent <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Emory CLIF Data/clif_respiratory_support.parquet") %>%
-  filter(device_category == "IMV") %>%
+vent <- read_clif_table("respiratory_support") %>%
+  lower_category_fields() %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
+  filter(device_category == "imv") %>%
   group_by(hospitalization_id) %>%
   summarize(vent_time = min(recorded_dttm), .groups = "drop") 
 
 #vasopressors 
-vasopressor <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Emory CLIF Data/clif_medication_admin_continuous.parquet") %>%
+vasopressor <- read_clif_table("medication_admin_continuous") %>%
+  lower_category_fields() %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
   filter(med_group == 'vasoactives') %>%
   group_by(hospitalization_id) %>%
   summarize(vasopressor_time = min(admin_dttm), .groups = "drop") 
@@ -100,7 +179,7 @@ mortality_30 <- hosp %>%
 mortality_30 <- mortality_30 %>%
   group_by(hospitalization_id) %>%
   mutate(death_within_30 = !is.na(death_dttm) & death_dttm <= admission_dttm + days(30),
-         death_dispo_within_30 = discharge_category %in% c("Expired", "Hospice") & discharge_dttm <= admission_dttm + days(30),
+         death_dispo_within_30 = discharge_category %in% c("expired", "hospice") & discharge_dttm <= admission_dttm + days(30),
          death_time = case_when(death_within_30 ~ death_dttm,   # prioritize actual death time if both happen
                                 death_dispo_within_30 ~ discharge_dttm,
                                 TRUE ~ as.POSIXct(NA)))
@@ -120,11 +199,13 @@ demo_outcomes <- demo %>% left_join(icu, by='hospitalization_id') %>%
                           left_join(mortality_30, by=c('hospitalization_id', 'patient_id')) %>%
                           left_join(hosp_los, by=c('hospitalization_id', 'patient_id'))
 
-#write_parquet(demo_outcomes, "/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Documents/Dr. Siva Bhavani/EDI Prediction Model/ALL PATIENTS/Saved Data/demo_outcomes.parquet")
+write_parquet(demo_outcomes, file.path(intermediate_output_directory, paste0(site_name, "_demo_outcomes.parquet")))
 
 # ********************************************************************************************************************************************************************************************************************************
 # 2.) REFINE COHORT
-adt <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Emory CLIF Data/clif_adt.parquet")
+adt <- read_clif_table("adt") %>%
+  lower_category_fields() %>%
+  mutate(hospitalization_id = as.character(hospitalization_id))
 
 # location at some point in IP
 adt2 <- adt %>%
@@ -154,14 +235,14 @@ adt5 <- adt4 %>%
   select(hospitalization_id) %>%
   inner_join(hosp %>% select(patient_id, hospitalization_id, admission_dttm, discharge_dttm),
     by = "hospitalization_id") %>% distinct()
-#write_parquet(adt5, "/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Documents/Dr. Siva Bhavani/EDI Prediction Model/ALL PATIENTS/Saved Data/adt5.parquet")
+write_parquet(adt5, file.path(intermediate_output_directory, paste0(site_name, "_adt5.parquet")))
 
 
 
 
 
 # ***** EDI  ****
-edi <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Emory CLIF Data/clif_scores.parquet") %>% filter(model_id == '30434503') #model_name == 'IP Deterioration Index'
+edi <- read_project_file(score_path) %>% standardize_edi_scores()
 edi2 <- edi %>% inner_join(adt5, by='hospitalization_id')
 
 # 1+ EDI score after arrival & before discharge
@@ -173,7 +254,7 @@ edi3 <- edi2 %>% filter(arrival_to_score >= 0 & score_to_discharge <= 0)
 
 #Bring in demographics 
 edi4 <- edi3 %>% select(-admission_dttm, -discharge_dttm) %>% inner_join(demo_outcomes, by=c('patient_id', 'hospitalization_id'))
-#write_parquet(edi4, "/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Documents/Dr. Siva Bhavani/EDI Prediction Model/ALL PATIENTS/Saved Data/edi4.parquet")
+write_parquet(edi4, file.path(intermediate_output_directory, paste0(site_name, "_edi4.parquet")))
 
 
 # length(unique(adt$hospitalization_id)) #1,482,960 # hospitalizations
@@ -187,13 +268,13 @@ edi4 <- edi3 %>% select(-admission_dttm, -discharge_dttm) %>% inner_join(demo_ou
 # ********************************************************************************************************************************************************************************************************************************
 # 3.) DATA ANALYSIS
 
-#edi4 <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Documents/Dr. Siva Bhavani/EDI Prediction Model/ALL PATIENTS/Saved Data/edi4.parquet")
+# edi4 <- read_parquet(file.path(output_directory, "intermediate_phi", paste0(site_name, "_edi4.parquet")))
 
 
 # **************************** TABLE 1: DEMOGRAPHICS ****************************
 # 1.) ALL ENCOUNTERS 
 table1 <- edi4 %>% select(-recorded_dttm, -score_value, -arrival_to_score, -score_to_discharge) %>% ungroup() %>% distinct() #1 row per enc
-# write_parquet(table1, "/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Documents/Dr. Siva Bhavani/EDI Prediction Model/ALL PATIENTS/Saved Data/table1.parquet")
+write_parquet(table1, file.path(intermediate_output_directory, paste0(site_name, "_table1.parquet")))
 
 
 quantile(table1$age_at_admission,  probs = c(0.25, 0.5, 0.75),  na.rm = TRUE) #age
@@ -213,10 +294,10 @@ table1 %>% summarise(N = n(),
                     Vent_pct = mean(!is.na(vent_time)) * 100)
 
 
-# 2.) MAX THRESHOLD >=40 
+# 2.) MAX THRESHOLD >= CONFIGURED THRESHOLD
 edi_GE_40 <- edi4 %>% 
   group_by(hospitalization_id) %>% 
-  filter(max(score_value) >= 40) %>% 
+  filter(max(score_value) >= threshold) %>% 
   select(-recorded_dttm, -score_value, -arrival_to_score, -score_to_discharge) %>% 
   ungroup() %>% distinct() 
 #length(unique(edi_GE_40$hospitalization_id)) #27,017
@@ -238,10 +319,10 @@ edi_GE_40 %>% summarise(N = n(),
                      Vent_pct = mean(!is.na(vent_time)) * 100)
 
 
-# 3.) MAX THRESHOLD <40 
+# 3.) MAX THRESHOLD < CONFIGURED THRESHOLD
 edi_LT_40 <- edi4 %>% 
   group_by(hospitalization_id) %>% 
-  filter(max(score_value) < 40) %>% 
+  filter(max(score_value) < threshold) %>% 
   select(-recorded_dttm, -score_value, -arrival_to_score, -score_to_discharge) %>% 
   ungroup() %>% distinct() 
 #length(unique(edi_LT_40$hospitalization_id)) #45,207
@@ -267,10 +348,10 @@ edi_LT_40 %>% summarise(N = n(),
 
 # **************************** TABLE 2: EDI PERFORMANCE EVALUATION ****************************
 
-threshold <- 40.0
+threshold <- as.numeric(config_value("edi_threshold", 40))
 
 # ************************** OUTCOME 1: ICU **************************
-#edi4 <- read_parquet("/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Documents/Dr. Siva Bhavani/EDI Prediction Model/ALL PATIENTS/Saved Data/edi4.parquet")
+# edi4 <- read_parquet(file.path(output_directory, "intermediate_phi", paste0(site_name, "_edi4.parquet")))
 icu <- edi4 %>% filter(is.na(icu_time) | icu_time > recorded_dttm)
 
 # 1.) TIME HORIZON 12 
@@ -956,7 +1037,7 @@ fig_1_data <- bind_rows(
   vent_hosp, vent_12, vent_24,
   mortality_hosp, mortality_12, mortality_24,
   adverse_hosp, adverse_12, adverse_24)
-# write_parquet(fig_1_data, "/Users/mcschwi/Library/CloudStorage/OneDrive-EmoryUniversity/Documents/Dr. Siva Bhavani/EDI Prediction Model/ALL PATIENTS/Saved Data/fig_1_data.parquet")
+write_parquet(fig_1_data, file.path(intermediate_output_directory, paste0(site_name, "_fig_1_data.parquet")))
 
 fig_1_df <- fig_1_data %>%
   filter(Metric %in% c("AUC", "Sensitivity", "Specificity", "PPV")) %>%
@@ -964,7 +1045,7 @@ fig_1_df <- fig_1_data %>%
     Horizon = factor(Horizon, levels = c("12h", "24h", "Hospital-Level")),
     Outcome = factor(Outcome, levels = c("Adverse Outcome", "ICU", "Vasopressors",
                                         "Ventilator", "30-Day Mortality")),
-    site = "emory")
+    site = site_name)
 
 fig_1 <- ggplot(fig_1_df, aes(x = Estimate, y = Outcome)) +
   geom_point(size = 2) +
@@ -989,21 +1070,21 @@ fig_1 <- ggplot(fig_1_df, aes(x = Estimate, y = Outcome)) +
     panel.grid.major.y = element_blank(),
     panel.grid.minor = element_blank()) +
   labs(
-    title = "Performance of the EDI for Adverse Clinical Outcomes - Emory",
-    subtitle = "EDI Threshold = 40; N = 72,224",
+    title = paste("Performance of the EDI for Adverse Clinical Outcomes -", str_to_title(site_name)),
+    subtitle = paste0("EDI Threshold = ", threshold, "; N = ", format(n_distinct(table1$hospitalization_id), big.mark = ",")),
     x = "Performance (Estimate with 95% CI)",
     y = NULL)
 
 
 #Save Figure 1
-ggsave(filename = "/Users/mcschwi/Desktop/fig_1.png",
+ggsave(filename = file.path(final_output_directory, paste0(site_name, "_fig_1.png")),
   plot = fig_1,
   width = 12,
   height = 6,
   dpi = 300)
 
 #Save Fig 1 Dataframe
-write.csv(fig_1_df, "/Users/mcschwi/Desktop/fig_1_df.csv")
+write.csv(fig_1_df, file.path(final_output_directory, paste0(site_name, "_fig_1_df.csv")), row.names = FALSE)
 
 
 # ************************** IDEA 1: CALIBRATION PLOT FOR ADVERSE OUTCOME - ENCOUNTER-LEVEL  **************************
@@ -1027,15 +1108,21 @@ fig_2_df <- adverse_cal %>%
         cal_model,
         newdata = adverse_cal,
         type = "response"),
-      site = "emory")
+      site = site_name)
 
 #plot - stops at .25 - still dont quite understand
-fig_2 <- fig_2_df %>%
+fig_2_plot_df <- fig_2_df %>%
   mutate(bin = ntile(pred_prob, 10)) %>%
   group_by(bin) %>%
   summarise(
+    site = first(site),
+    n = n(),
     mean_pred = mean(pred_prob),
-    obs_rate = mean(Outcome)) %>%
+    obs_rate = mean(Outcome),
+    .groups = "drop") %>%
+  filter(n >= minimum_cell_size)
+
+fig_2 <- fig_2_plot_df %>%
   ggplot(aes(mean_pred, obs_rate)) +
   geom_point(size = 3) +
   geom_line() +
@@ -1048,18 +1135,18 @@ fig_2 <- fig_2_df %>%
     axis.title.x = element_text(family = "Times New Roman", size = 14),
     axis.title.y = element_text(family = "Times New Roman", size = 14)) +
   labs(x = "Predicted risk (EDI)",
-      y = "Observed Rutcome Rate",
+      y = "Observed Outcome Rate",
       title = "Calibration of EDI for Adverse Outcome")
 
 #Save Figure 2
-ggsave(filename = "/Users/mcschwi/Desktop/fig_2.png",
+ggsave(filename = file.path(final_output_directory, paste0(site_name, "_fig_2.png")),
        plot = fig_2,
        width = 12,
        height = 6,
        dpi = 300)
 
 #Save Fig 2 Dataframe
-write.csv(fig_2_df, "/Users/mcschwi/Desktop/fig_2_df.csv")
+write.csv(fig_2_plot_df, file.path(final_output_directory, paste0(site_name, "_fig_2_df.csv")), row.names = FALSE)
 
 
 
@@ -1067,7 +1154,7 @@ write.csv(fig_2_df, "/Users/mcschwi/Desktop/fig_2_df.csv")
 fig_3_df <- edi4 %>%
   group_by(hospitalization_id) %>%
   summarise(
-    site = "emory",
+    site = site_name,
     icu = any(!is.na(icu_time)),
     vaso = any(!is.na(vasopressor_time)),
     vent = any(!is.na(vent_time)),
@@ -1091,18 +1178,16 @@ fig_3 <- ggVennDiagram(venn_list) +
       hjust = 0.5)) +
   labs(title = "Overlap of Components of Adverse Outcome Composite")
 
+fig_3_counts <- fig_3_df %>%
+  count(site, icu, vaso, vent, mortality, name = "n") %>%
+  filter(n >= minimum_cell_size)
+
 #Save Figure 3
-ggsave(filename = "/Users/mcschwi/Desktop/fig_3.png",
+ggsave(filename = file.path(final_output_directory, paste0(site_name, "_fig_3.png")),
        plot = fig_3,
        width = 12,
        height = 6,
        dpi = 300)
 
 #Save Fig 3 Dataframe
-write.csv(fig_3_df, "/Users/mcschwi/Desktop/fig_3_df.csv")
-
-
-
-
-
-
+write.csv(fig_3_counts, file.path(final_output_directory, paste0(site_name, "_fig_3_df.csv")), row.names = FALSE)

@@ -1,7 +1,14 @@
 {
-    "site_name": "Your_Site_Name",
-    "data_directory": "./clif_demo",
-    "filetype": "parquet",
-    "timezone": "US/Eastern",
-    "output_directory": "./output"
+  "site_name": "Your_Site_Name",
+  "data_directory": "./clif_demo",
+  "filetype": "parquet",
+  "timezone": "US/Eastern",
+  "output_directory": "./output",
+  "score_file": "clif_scores.parquet",
+  "score_hospitalization_id_column": "hospitalization_id",
+  "score_time_column": "recorded_dttm",
+  "score_value_column": "score_value",
+  "edi_model_id": "30434503",
+  "edi_threshold": 40,
+  "minimum_cell_size": 10
 }

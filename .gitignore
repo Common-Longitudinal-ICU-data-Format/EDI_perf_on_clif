@@ -24,3 +24,7 @@ clif_*.fst
 # NEVER commit patient-level intermediate outputs (PHI) — keep only the folder's README
 output/intermediate_phi/*
 !output/intermediate_phi/README.md
+
+# Ignore generated final aggregate outputs; keep the folder placeholder
+output/final_no_phi/*
+!output/final_no_phi/.gitkeep
