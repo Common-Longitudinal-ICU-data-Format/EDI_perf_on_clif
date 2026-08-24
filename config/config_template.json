@@ -1,6 +1,6 @@
 {
-  "site_name": "Your_Site_Name",
-  "data_directory": "./clif_demo",
+  "site_name": "your_site",
+  "data_directory": "/path/to/clif/data",
   "filetype": "parquet",
   "timezone": "US/Eastern",
   "output_directory": "./output",
@@ -8,7 +8,27 @@
   "score_hospitalization_id_column": "hospitalization_id",
   "score_time_column": "recorded_dttm",
   "score_value_column": "score_value",
-  "edi_model_id": "30434503",
+  "score_model_id_column": null,
+  "score_model_id_value": null,
+  "edi_model_id": null,
   "edi_threshold": 40,
-  "minimum_cell_size": 10
+  "minimum_cell_size": 10,
+  "cohort": {
+    "min_age": 18,
+    "ward_eligibility": ["ward"],
+    "allowed_initial_locations": ["ed", "ward"],
+    "ed_locations": ["ed"],
+    "excluded_second_locations": ["icu", "procedural"]
+  },
+  "events": {
+    "icu_locations": ["icu"],
+    "imv_devices": ["imv"],
+    "vasopressor_med_groups": ["vasoactives"],
+    "procedural_locations": ["procedural"],
+    "mortality_discharge_categories": ["expired", "hospice"]
+  },
+  "analysis": {"horizons_hours": [4, 12], "calibration_bins": 10},
+  "trajectory": {"window_hours": 24, "bin_width_hours": 1, "min_n": 20, "seed": 123},
+  "threshold_grid": {"min": 0, "max": 100, "step": 5},
+  "lead_time": {"min_n": 20}
 }
