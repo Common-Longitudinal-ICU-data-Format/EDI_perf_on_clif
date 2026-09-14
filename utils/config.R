@@ -35,6 +35,7 @@ config_defaults <- list(
   score_value_column = "score_value",
   score_model_id_column = NULL,
   score_model_id_value = NULL,
+  score_source_verified_edi_only = FALSE,
   edi_model_id = NULL,
   edi_threshold = 40,
   minimum_cell_size = 10,
@@ -69,6 +70,49 @@ if (is.null(config$score_model_id_value) && !is.null(config$edi_model_id)) {
 }
 if (!is.null(config$score_model_id_value) && is.null(config$score_model_id_column)) {
   config$score_model_id_column <- "model_id"
+}
+
+has_model_id_column <- !is.null(config$score_model_id_column)
+has_model_id_value <- !is.null(config$score_model_id_value)
+if (xor(has_model_id_column, has_model_id_value)) {
+  stop(
+    "score_model_id_column and score_model_id_value must be configured together.",
+    call. = FALSE
+  )
+}
+if (has_model_id_column && (
+  length(config$score_model_id_column) != 1L ||
+    is.na(config$score_model_id_column) ||
+    !nzchar(trimws(as.character(config$score_model_id_column)))
+)) {
+  stop("score_model_id_column must be a non-empty scalar when configured.", call. = FALSE)
+}
+if (has_model_id_value && (
+  length(config$score_model_id_value) != 1L ||
+    is.na(config$score_model_id_value) ||
+    !nzchar(trimws(as.character(config$score_model_id_value)))
+)) {
+  stop("score_model_id_value must be a non-empty scalar when configured.", call. = FALSE)
+}
+if (!is.logical(config$score_source_verified_edi_only) ||
+    length(config$score_source_verified_edi_only) != 1L ||
+    is.na(config$score_source_verified_edi_only)) {
+  stop("score_source_verified_edi_only must be true or false.", call. = FALSE)
+}
+if (!has_model_id_column && !config$score_source_verified_edi_only) {
+  stop(
+    paste0(
+      "Configure score_model_id_column and score_model_id_value, or set ",
+      "score_source_verified_edi_only to true after verifying the score source contains only EDI."
+    ),
+    call. = FALSE
+  )
+}
+if (has_model_id_column && config$score_source_verified_edi_only) {
+  stop(
+    "score_source_verified_edi_only must be false when a model filter is configured.",
+    call. = FALSE
+  )
 }
 
 required_text <- c("site_name", "data_directory", "filetype", "timezone", "output_directory",

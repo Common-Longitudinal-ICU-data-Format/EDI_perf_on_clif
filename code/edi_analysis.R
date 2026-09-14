@@ -395,6 +395,10 @@ if (!is.null(config$score_model_id_column) && !is.null(config$score_model_id_val
     model_value <- suppressWarnings(as.numeric(model_value))
     if (!is.finite(model_value)) stop("score model ID is incompatible with its source column.", call. = FALSE)
   }
+  log_step(paste0(
+    "Filtering score source to ", config$score_model_id_column,
+    " = ", as.character(model_value)
+  ))
   score_query <- score_query %>%
     filter(.data[[config$score_model_id_column]] == model_value)
 }
@@ -424,7 +428,18 @@ scores <- score_query %>%
   select(hospitalization_id, recorded_dttm, score_value) %>%
   distinct()
 if (!nrow(scores)) {
-  stop("No valid in-admission scores matched the location-eligible cohort.", call. = FALSE)
+  model_filter <- if (is.null(config$score_model_id_column)) {
+    "without a configured model filter"
+  } else {
+    paste0(
+      "after filtering ", config$score_model_id_column,
+      " = ", config$score_model_id_value
+    )
+  }
+  stop(
+    "No valid in-admission scores matched the location-eligible cohort ", model_filter, ".",
+    call. = FALSE
+  )
 }
 arrow::write_parquet(scores, phi_path("eligible_in_admission_scores"))
 
@@ -1037,7 +1052,7 @@ package_versions <- vapply(
 manifest <- tibble(
   key = c(
     "site", "completed_utc", "workflow", "filetype", "timezone", "r_version",
-    "threshold", "minimum_cell_size", "minimum_age", "horizons_hours",
+    "threshold", "minimum_cell_size", "minimum_age", "horizons_hours", "score_model_filter",
     paste0("package_", names(package_versions))
   ),
   value = c(
@@ -1045,6 +1060,11 @@ manifest <- tibble(
     config$filetype, timezone, paste(R.version$major, R.version$minor, sep = "."),
     as.character(threshold), as.character(minimum_cell_size),
     as.character(config$cohort$min_age), paste(horizons, collapse = ","),
+    if (is.null(config$score_model_id_column)) {
+      "verified_edi_only_source"
+    } else {
+      paste0(config$score_model_id_column, "=", config$score_model_id_value)
+    },
     unname(package_versions)
   )
 )

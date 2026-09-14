@@ -13,7 +13,8 @@ Copy `config_template.json` to the ignored `config.json`, then edit it for the l
 - `score_hospitalization_id_column`: Score encounter-ID column.
 - `score_time_column`: Score timestamp column.
 - `score_value_column`: Numeric EDI score column.
-- `score_model_id_column` and `score_model_id_value`: Optional model filter. Set both to `null` when the score file already contains only EDI.
+- `score_model_id_column` and `score_model_id_value`: Model filter. Configure both for any score file that can contain more than one model. The workflow rejects configurations that provide only one of these fields.
+- `score_source_verified_edi_only`: Set to `true` only when both model-filter fields are `null` and the score source has been verified to contain only EDI. It must be `false` when a model filter is configured.
 - `edi_model_id`: Legacy alias for `score_model_id_value`; prefer the explicit model fields for new configurations.
 
 ## Protocol

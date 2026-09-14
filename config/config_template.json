@@ -10,6 +10,7 @@
   "score_value_column": "score_value",
   "score_model_id_column": null,
   "score_model_id_value": null,
+  "score_source_verified_edi_only": false,
   "edi_model_id": null,
   "edi_threshold": 40,
   "minimum_cell_size": 10,

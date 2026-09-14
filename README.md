@@ -48,7 +48,7 @@ cp config/config_template.json config/config.json
 Update the following groups in `config/config.json`:
 
 -   Site and storage: `site_name`, `data_directory`, `filetype`, `timezone`, and `output_directory`.
--   Score source: `score_file`, score column mappings, and optional model-ID column/value.
+-   Score source: `score_file`, score column mappings, and model-ID column/value. Configure both model-ID fields for mixed-model sources. An unfiltered source requires the explicit `score_source_verified_edi_only: true` assertion.
 -   Cohort: minimum age and location category lists.
 -   Events: ICU, IMV, vasopressor, procedural, and mortality-disposition categories.
 -   Analysis: EDI threshold, prediction horizons, calibration bins, trajectory settings, threshold grid, lead-time minimum N, and `minimum_cell_size`.
