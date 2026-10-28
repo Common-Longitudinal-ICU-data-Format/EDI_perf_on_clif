@@ -5,12 +5,12 @@
   "timezone": "US/Eastern",
   "output_directory": "./output",
   "score_file": "clif_scores.parquet",
+  "model_registry_file": "clif_model_registry.parquet",
   "score_hospitalization_id_column": "hospitalization_id",
   "score_time_column": "recorded_dttm",
   "score_value_column": "score_value",
-  "score_model_id_column": null,
-  "score_model_id_value": null,
-  "edi_model_id": null,
+  "score_model_id_column": "model_id",
+  "score_model_category": "epic_deterioration_index",
   "edi_threshold": 40,
   "minimum_cell_size": 10,
   "cohort": {
@@ -30,5 +30,7 @@
   "analysis": {"horizons_hours": [4, 12], "calibration_bins": 10},
   "trajectory": {"window_hours": 24, "bin_width_hours": 1, "min_n": 20, "seed": 123},
   "threshold_grid": {"min": 0, "max": 100, "step": 5},
-  "lead_time": {"min_n": 20}
+  "lead_time": {"min_n": 20},
+  "threshold_crossing": {"min": 0, "max": 100, "step": 1},
+  "first_crossing": {"bin_hours": 6, "max_hours_plot": 72}
 }

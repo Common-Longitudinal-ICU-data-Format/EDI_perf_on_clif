@@ -24,6 +24,9 @@ suppressPackageStartupMessages({
   library(lubridate)
   library(ggplot2)
 })
+source(file.path("utils", "model_registry.R"))
+source(file.path("utils", "threshold_crossing.R"))
+source(file.path("utils", "time.R"))
 
 site_name <- config$site_name
 timezone <- config$timezone
@@ -52,13 +55,7 @@ normalize_id <- function(x) {
   x
 }
 
-normalize_time <- function(x) {
-  if (inherits(x, "POSIXt")) {
-    return(lubridate::force_tz(as.POSIXct(x), tzone = timezone))
-  }
-  if (is.numeric(x)) return(as.POSIXct(x, origin = "1970-01-01", tz = timezone))
-  suppressWarnings(lubridate::ymd_hms(as.character(x), tz = timezone, quiet = TRUE))
-}
+normalize_time <- function(x) normalize_clif_time(x, timezone)
 
 clean_category <- function(x) tolower(trimws(as.character(x)))
 
@@ -66,9 +63,19 @@ input_path <- function(name) {
   file.path(config$data_directory, paste0("clif_", name, ".", config$filetype))
 }
 
-open_input <- function(path) {
+configured_input_path <- function(filename) {
+  if (grepl("^(/|[A-Za-z]:[/\\\\])", filename)) filename else file.path(config$data_directory, filename)
+}
+
+open_input <- function(path, id_columns) {
   if (!file.exists(path) && !dir.exists(path)) {
     stop("Missing required input: ", path, call. = FALSE)
+  }
+  if (config$filetype == "csv") {
+    # Opaque keys must not be inferred independently as numbers (e.g. "001").
+    types <- setNames(rep(list(arrow::utf8()), length(id_columns)), id_columns)
+    options <- arrow::CsvConvertOptions$create(col_types = do.call(arrow::schema, types))
+    return(arrow::open_dataset(path, format = "csv", convert_options = options))
   }
   arrow::open_dataset(path, format = config$filetype)
 }
@@ -80,27 +87,11 @@ require_columns <- function(dataset, columns, label) {
   }
 }
 
-field_is_numeric <- function(dataset, column) {
-  type <- tryCatch(
-    dataset$schema$GetFieldByName(column)$type$ToString(),
-    error = function(e) ""
-  )
-  grepl("int|float|double|decimal", tolower(type))
-}
-
-ids_for_field <- function(dataset, column, ids) {
-  if (!field_is_numeric(dataset, column)) return(as.character(ids))
-  numeric_ids <- suppressWarnings(as.numeric(ids))
-  if (anyNA(numeric_ids)) {
-    stop("Configured/source ID types are incompatible for column ", column, ".", call. = FALSE)
-  }
-  numeric_ids
-}
-
 filter_dataset_ids <- function(dataset, column, ids) {
   require_columns(dataset, column, "Input dataset")
-  source_ids <- ids_for_field(dataset, column, ids)
-  dataset %>% filter(.data[[column]] %in% source_ids)
+  source_ids <- as.character(ids)
+  # Cast in Arrow, where int64/decimal keys still have their exact representation.
+  dataset %>% filter(as.character(.data[[column]]) %in% source_ids)
 }
 
 safe_quantiles <- function(x) {
@@ -149,8 +140,17 @@ jsonlite::write_json(config, file.path(phi_dir, "validated_config_snapshot.json"
                      pretty = TRUE, auto_unbox = TRUE, null = "null")
 
 # Cohort inputs ---------------------------------------------------------------
+log_step("Resolving EDI models from clif_model_registry categories")
+registry_ds <- open_input(configured_input_path(config$model_registry_file), "model_id")
+require_columns(registry_ds, c("model_id", "model_category"), "clif_model_registry")
+model_registry <- registry_ds %>% select(model_id, model_category) %>%
+  mutate(model_id = as.character(model_id)) %>% collect()
+edi_model_ids <- resolve_edi_model_ids(model_registry, config$score_model_category)
+arrow::write_parquet(
+  model_registry %>% filter(model_id %in% edi_model_ids), phi_path("selected_edi_models")
+)
 log_step("Loading cohort inputs")
-hosp_ds <- open_input(input_path("hospitalization"))
+hosp_ds <- open_input(input_path("hospitalization"), c("patient_id", "hospitalization_id"))
 hosp_columns <- c(
   "patient_id", "hospitalization_id", "admission_dttm", "discharge_dttm",
   "age_at_admission", "discharge_category"
@@ -167,6 +167,7 @@ all_hospitalizations <- hosp_ds %>%
 hosp <- hosp_ds %>%
   select(all_of(hosp_columns)) %>%
   filter(age_at_admission >= config$cohort$min_age) %>%
+  mutate(patient_id = as.character(patient_id), hospitalization_id = as.character(hospitalization_id)) %>%
   collect() %>%
   transmute(
     patient_id = normalize_id(patient_id),
@@ -184,11 +185,12 @@ hosp <- hosp_ds %>%
 adult_hospitalizations <- nrow(hosp)
 arrow::write_parquet(hosp, phi_path("adult_hospitalizations"))
 
-adt_ds <- open_input(input_path("adt"))
+adt_ds <- open_input(input_path("adt"), "hospitalization_id")
 adt_columns <- c("hospitalization_id", "in_dttm", "out_dttm", "location_category")
 require_columns(adt_ds, adt_columns, "clif_adt")
 adt <- filter_dataset_ids(adt_ds, "hospitalization_id", hosp$hospitalization_id) %>%
   select(all_of(adt_columns)) %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
   collect() %>%
   transmute(
     hospitalization_id = normalize_id(hospitalization_id),
@@ -241,13 +243,14 @@ eligible_hosp <- hosp %>%
 arrow::write_parquet(eligible_hosp, phi_path("location_eligible_cohort"))
 
 # Demographics and in-admission outcomes -------------------------------------
-patient_ds <- open_input(input_path("patient"))
+patient_ds <- open_input(input_path("patient"), "patient_id")
 patient_columns <- c(
   "patient_id", "death_dttm", "sex_category", "race_category", "ethnicity_category"
 )
 require_columns(patient_ds, patient_columns, "clif_patient")
 patient <- filter_dataset_ids(patient_ds, "patient_id", eligible_hosp$patient_id) %>%
   select(all_of(patient_columns)) %>%
+  mutate(patient_id = as.character(patient_id)) %>%
   collect() %>%
   transmute(
     patient_id = normalize_id(patient_id),
@@ -289,7 +292,7 @@ icu <- eligible_adt %>%
   filter(location_category %in% config$events$icu_locations) %>%
   group_by(hospitalization_id) %>%
   summarise(
-    icu_time = min(interval_start),
+    icu_time = if (n()) min(interval_start) else as.POSIXct(NA, tz = timezone),
     icu_los_days = interval_union_days(interval_start, interval_end),
     .groups = "drop"
   )
@@ -298,12 +301,13 @@ procedural <- eligible_adt %>%
   distinct(hospitalization_id) %>%
   mutate(procedural = TRUE)
 
-resp_ds <- open_input(input_path("respiratory_support"))
+resp_ds <- open_input(input_path("respiratory_support"), "hospitalization_id")
 resp_columns <- c("hospitalization_id", "recorded_dttm", "device_category")
 require_columns(resp_ds, resp_columns, "clif_respiratory_support")
 imv <- filter_dataset_ids(resp_ds, "hospitalization_id", eligible_hosp$hospitalization_id) %>%
   select(all_of(resp_columns)) %>%
   filter(tolower(device_category) %in% config$events$imv_devices) %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
   collect() %>%
   transmute(
     hospitalization_id = normalize_id(hospitalization_id),
@@ -319,14 +323,15 @@ imv <- filter_dataset_ids(resp_ds, "hospitalization_id", eligible_hosp$hospitali
     event_time >= admission_dttm, event_time <= discharge_dttm
   ) %>%
   group_by(hospitalization_id) %>%
-  summarise(imv_time = min(event_time), .groups = "drop")
+  summarise(imv_time = if (n()) min(event_time) else as.POSIXct(NA, tz = timezone), .groups = "drop")
 
-med_ds <- open_input(input_path("medication_admin_continuous"))
+med_ds <- open_input(input_path("medication_admin_continuous"), "hospitalization_id")
 med_columns <- c("hospitalization_id", "admin_dttm", "med_group")
 require_columns(med_ds, med_columns, "clif_medication_admin_continuous")
 vasopressor <- filter_dataset_ids(med_ds, "hospitalization_id", eligible_hosp$hospitalization_id) %>%
   select(all_of(med_columns)) %>%
   filter(tolower(med_group) %in% config$events$vasopressor_med_groups) %>%
+  mutate(hospitalization_id = as.character(hospitalization_id)) %>%
   collect() %>%
   transmute(
     hospitalization_id = normalize_id(hospitalization_id),
@@ -342,7 +347,7 @@ vasopressor <- filter_dataset_ids(med_ds, "hospitalization_id", eligible_hosp$ho
     event_time >= admission_dttm, event_time <= discharge_dttm
   ) %>%
   group_by(hospitalization_id) %>%
-  summarise(vasopressor_time = min(event_time), .groups = "drop")
+  summarise(vasopressor_time = if (n()) min(event_time) else as.POSIXct(NA, tz = timezone), .groups = "drop")
 
 encounters <- eligible_hosp %>%
   left_join(patient, by = "patient_id") %>%
@@ -372,41 +377,30 @@ encounters <- eligible_hosp %>%
 
 # Filter the very large score source before collection. The eligible result is
 # checkpointed so downstream analyses never need to rescan the source file.
-score_path <- if (grepl("^(/|[A-Za-z]:[/\\\\])", config$score_file)) {
-  config$score_file
-} else {
-  file.path(config$data_directory, config$score_file)
-}
-score_ds <- open_input(score_path)
+score_ds <- open_input(configured_input_path(config$score_file),
+                       c(config$score_hospitalization_id_column, config$score_model_id_column))
 score_columns <- c(
   config$score_hospitalization_id_column,
   config$score_time_column,
-  config$score_value_column
+  config$score_value_column,
+  config$score_model_id_column
 )
-if (!is.null(config$score_model_id_column)) {
-  score_columns <- c(score_columns, config$score_model_id_column)
-}
 require_columns(score_ds, unique(score_columns), "score source")
 
-score_query <- score_ds
-if (!is.null(config$score_model_id_column) && !is.null(config$score_model_id_value)) {
-  model_value <- config$score_model_id_value
-  if (field_is_numeric(score_ds, config$score_model_id_column)) {
-    model_value <- suppressWarnings(as.numeric(model_value))
-    if (!is.finite(model_value)) stop("score model ID is incompatible with its source column.", call. = FALSE)
-  }
-  score_query <- score_query %>%
-    filter(.data[[config$score_model_id_column]] == model_value)
-}
-score_source_ids <- ids_for_field(
-  score_ds, config$score_hospitalization_id_column, eligible_hosp$hospitalization_id
-)
-score_query <- score_query %>%
-  filter(.data[[config$score_hospitalization_id_column]] %in% score_source_ids)
+source_model_ids <- score_ds %>%
+  select(all_of(config$score_model_id_column)) %>%
+  mutate(across(everything(), as.character)) %>% distinct() %>% collect() %>%
+  pull(all_of(config$score_model_id_column))
+validate_score_model_ids(source_model_ids, model_registry)
+log_step(paste0("Filtering score source to category ", config$score_model_category,
+                " (", length(edi_model_ids), " registry model IDs)"))
+score_query <- filter_dataset_ids(score_ds, config$score_model_id_column, edi_model_ids)
+score_query <- filter_dataset_ids(score_query, config$score_hospitalization_id_column, eligible_hosp$hospitalization_id)
 
 log_step("Collecting eligible score rows")
 scores <- score_query %>%
   select(all_of(unique(score_columns[1:3]))) %>%
+  mutate(across(all_of(config$score_hospitalization_id_column), as.character)) %>%
   collect() %>%
   transmute(
     hospitalization_id = normalize_id(.data[[config$score_hospitalization_id_column]]),
@@ -424,7 +418,11 @@ scores <- score_query %>%
   select(hospitalization_id, recorded_dttm, score_value) %>%
   distinct()
 if (!nrow(scores)) {
-  stop("No valid in-admission scores matched the location-eligible cohort.", call. = FALSE)
+  stop(
+    "No valid in-admission scores matched the location-eligible cohort after selecting category ",
+    config$score_model_category, " from clif_model_registry.",
+    call. = FALSE
+  )
 }
 arrow::write_parquet(scores, phi_path("eligible_in_admission_scores"))
 
@@ -483,7 +481,7 @@ write_final_csv(flow_public, "flowsheet_summary")
 
 rm(hosp_ds, adt_ds, patient_ds, resp_ds, med_ds, score_ds, score_query, patient,
    hosp, adt, eligible_adt, eligible_hosp, location_eligible, location_summary,
-   ward_ids, initial_ids, icu, imv, vasopressor, procedural)
+   ward_ids, initial_ids, icu, imv, vasopressor, procedural, registry_ds, model_registry)
 invisible(gc(verbose = FALSE))
 
 # Table 1 ---------------------------------------------------------------------
@@ -564,7 +562,10 @@ for (pair in count_pct_pairs) {
 }
 unsafe_stratum <- table1_public$N[-1] < minimum_cell_size |
   (table1_public$N[[1]] - table1_public$N[-1]) < minimum_cell_size
-if (any(unsafe_stratum)) table1_public$N[-1] <- NA_real_
+if (any(unsafe_stratum)) {
+  # Stratum percentages reveal their denominator even when N itself is hidden.
+  table1_public[-1, setdiff(names(table1_public), "cohort")] <- NA_real_
+}
 small_rows <- table1_internal$N < minimum_cell_size
 table1_public[small_rows, setdiff(names(table1_public), "cohort")] <- NA
 table1_public <- table1_public %>%
@@ -666,7 +667,7 @@ prepare_horizon_data <- function(data, event_column, horizon_hours) {
           as.numeric(recorded_dttm) - last_alert_num <= horizon_hours * 3600
       ),
       outcome = as.integer(
-        !is.na(event_time) & event_time <= recorded_dttm + hours(horizon_hours)
+        !is.na(event_time) & event_time <= recorded_dttm + dhours(horizon_hours)
       )
     ) %>%
     ungroup()
@@ -719,23 +720,28 @@ fig_1_plot_data <- fig_1_data %>%
     status == "Published",
     metric %in% c("AUC", "Sensitivity", "Specificity", "PPV")
   )
-fig_1 <- ggplot(fig_1_plot_data, aes(estimate, outcome)) +
-  geom_point(size = 2) +
-  geom_errorbar(aes(xmin = ci_lower, xmax = ci_upper), width = 0.2, orientation = "y") +
-  facet_grid(metric ~ horizon) +
-  coord_cartesian(xlim = c(0, 1)) +
-  theme_edi() +
-  labs(
-    title = paste("EDI Performance for Adverse Clinical Outcomes -", site_name),
-    x = "Estimate (95% CI)", y = NULL
-  )
+if (nrow(fig_1_plot_data)) {
+  fig_1 <- ggplot(fig_1_plot_data, aes(estimate, outcome)) +
+    geom_point(size = 2) +
+    geom_errorbar(aes(xmin = ci_lower, xmax = ci_upper), width = 0.2, orientation = "y") +
+    facet_grid(metric ~ horizon) +
+    coord_cartesian(xlim = c(0, 1)) +
+    theme_edi() +
+    labs(
+      title = paste("EDI Performance for Adverse Clinical Outcomes -", site_name),
+      x = "Estimate (95% CI)", y = NULL
+    )
+} else {
+  fig_1 <- ggplot() + annotate("text", x = 0, y = 0, label = "No publishable performance metrics") +
+    theme_void() + labs(title = paste("EDI Performance -", site_name))
+}
 save_plot(fig_1, "fig_1", 13, 8)
 
 # Figure 2: aggregate calibration --------------------------------------------
 log_step("Generating calibration and outcome intersections")
 calibration_source <- hospital_data[["Composite"]]
 calibration_aggregate <- tibble(
-  bin = integer(), n_encounters = integer(),
+  bin = integer(), n_encounters = integer(), events = integer(),
   mean_predicted_risk = double(), observed_event_rate = double()
 )
 if (nrow(calibration_source) >= minimum_cell_size && n_distinct(calibration_source$outcome) == 2L) {
@@ -860,7 +866,7 @@ set.seed(config$trajectory$seed)
 no_event_anchors <- no_event_rows %>%
   group_by(hospitalization_id) %>%
   summarise(min_time = min(recorded_dttm), max_time = max(recorded_dttm), .groups = "drop") %>%
-  mutate(earliest_anchor = min_time + hours(trajectory_window)) %>%
+  mutate(earliest_anchor = min_time + dhours(trajectory_window)) %>%
   filter(earliest_anchor <= max_time) %>%
   mutate(control_anchor = as.POSIXct(NA, tz = timezone))
 if (nrow(no_event_anchors)) {
@@ -954,18 +960,23 @@ fig_5_data <- threshold_long %>%
     status = if_else(publishable, "Published", "Suppressed")
   )
 write_final_csv(fig_5_data, "fig_5")
-fig_5 <- fig_5_data %>%
-  filter(status == "Published") %>%
-  ggplot(aes(threshold, estimate, color = outcome)) +
-  geom_line(linewidth = 0.8) +
-  facet_wrap(vars(metric), ncol = 2) +
-  coord_cartesian(ylim = c(0, 1)) +
-  theme_edi() +
-  theme(legend.position = "bottom") +
-  labs(
-    title = "Hospital-Level EDI Performance by Threshold",
-    x = "EDI threshold", y = "Estimate", color = "Outcome"
-  )
+if (any(fig_5_data$status == "Published")) {
+  fig_5 <- fig_5_data %>%
+    filter(status == "Published") %>%
+    ggplot(aes(threshold, estimate, color = outcome)) +
+    geom_line(linewidth = 0.8) +
+    facet_wrap(vars(metric), ncol = 2) +
+    coord_cartesian(ylim = c(0, 1)) +
+    theme_edi() +
+    theme(legend.position = "bottom") +
+    labs(
+      title = "Hospital-Level EDI Performance by Threshold",
+      x = "EDI threshold", y = "Estimate", color = "Outcome"
+    )
+} else {
+  fig_5 <- ggplot() + annotate("text", x = 0, y = 0, label = "No publishable threshold metrics") +
+    theme_void() + labs(title = "Hospital-Level EDI Performance by Threshold")
+}
 save_plot(fig_5, "fig_5", 13, 9)
 
 # Figure 6: lead time in hours ------------------------------------------------
@@ -1028,6 +1039,58 @@ fig_6 <- ggplot(
   )
 save_plot(fig_6, "fig_6", 11, 7)
 
+# Figure 7: crossing thresholds anywhere during the full hospitalization -------
+log_step("Generating full-hospitalization threshold crossing analyses")
+crossing_thresholds <- seq(
+  config$threshold_crossing$min, config$threshold_crossing$max,
+  by = config$threshold_crossing$step
+)
+crossing_internal <- summarize_threshold_crossings(max_scores$max_score, crossing_thresholds)
+arrow::write_parquet(crossing_internal, phi_path("threshold_crossing_internal"))
+table1_anchor <- table1_public$N[2]
+fig_7_data <- publish_threshold_crossings(
+  crossing_internal, minimum_cell_size,
+  anchor_counts = if (is.finite(table1_anchor)) table1_anchor else numeric()
+) %>% mutate(site = site_name, .before = 1)
+write_final_csv(fig_7_data, "fig_7")
+fig_7 <- ggplot(fig_7_data, aes(threshold, pct_reached)) +
+  geom_line(linewidth = 1, na.rm = TRUE) +
+  scale_y_continuous(limits = c(0, 100)) +
+  theme_edi() +
+  labs(title = "Hospitalizations Ever Crossing Each EDI Threshold",
+       x = "EDI threshold", y = "Hospitalizations (%)")
+save_plot(fig_7, "fig_7", 10, 6)
+
+# Figure 8: hours from admission to first crossing of the configured threshold --
+first_crossings <- first_threshold_crossings(scores, encounters, threshold)
+arrow::write_parquet(first_crossings, phi_path("first_threshold_crossings"))
+first_crossing_internal <- summarize_first_crossings(first_crossings, config$first_crossing$bin_hours)
+arrow::write_parquet(first_crossing_internal$hourly, phi_path("first_crossing_hourly_internal"))
+arrow::write_parquet(first_crossing_internal$summary, phi_path("first_crossing_summary_internal"))
+first_crossing_public <- publish_first_crossings(
+  first_crossing_internal, config$first_crossing$bin_hours, minimum_cell_size,
+  cohort_total = nrow(encounters)
+)
+fig_8_data <- first_crossing_public$hourly %>% mutate(site = site_name, .before = 1)
+fig_8_summary <- first_crossing_public$summary %>% mutate(site = site_name, .before = 1)
+fig_8_binned <- first_crossing_public$binned %>% mutate(site = site_name, .before = 1)
+write_final_csv(fig_8_data, "fig_8")
+write_final_csv(fig_8_summary, "fig_8_summary")
+if (any(is.finite(fig_8_binned$pct_crossed))) {
+  fig_8 <- ggplot(fig_8_binned, aes(hour_bin, pct_crossed, color = site)) +
+    geom_line(linewidth = 1, na.rm = TRUE) +
+    geom_point(size = 1.5, na.rm = TRUE) +
+    coord_cartesian(xlim = c(0, config$first_crossing$max_hours_plot)) +
+    theme_edi() + theme(legend.position = "bottom") +
+    labs(title = paste0("Time from Admission to First EDI Score >= ", threshold),
+         x = "Hours from admission", y = "% of threshold-crossing hospitalizations", color = "Site")
+} else {
+  fig_8 <- ggplot() +
+    annotate("text", x = 0, y = 0, label = "No publishable threshold-crossing intervals") +
+    theme_void() + labs(title = paste0("Time to First EDI Score >= ", threshold))
+}
+save_plot(fig_8, "fig_8", 10, 6)
+
 # Sanitized aggregate run metadata contains no local paths or row-level data.
 package_versions <- vapply(
   required_packages,
@@ -1037,14 +1100,19 @@ package_versions <- vapply(
 manifest <- tibble(
   key = c(
     "site", "completed_utc", "workflow", "filetype", "timezone", "r_version",
-    "threshold", "minimum_cell_size", "minimum_age", "horizons_hours",
+    "threshold", "minimum_cell_size", "minimum_age", "horizons_hours", "score_model_category",
+    "score_selection_method", "selected_model_count", "horizon_time_basis", "threshold_crossing_grid", "first_crossing_bin_hours",
+    "first_crossing_max_hours_plot",
     paste0("package_", names(package_versions))
   ),
   value = c(
-    site_name, format(Sys.time(), tz = "UTC", usetz = TRUE), "canonical_config_driven_v1",
+    site_name, format(Sys.time(), tz = "UTC", usetz = TRUE), "canonical_category_driven_v2",
     config$filetype, timezone, paste(R.version$major, R.version$minor, sep = "."),
     as.character(threshold), as.character(minimum_cell_size),
     as.character(config$cohort$min_age), paste(horizons, collapse = ","),
+    config$score_model_category, "clif_model_registry_category", as.character(length(edi_model_ids)), "elapsed_hours",
+    paste(c(config$threshold_crossing$min, config$threshold_crossing$max, config$threshold_crossing$step), collapse = ","),
+    as.character(config$first_crossing$bin_hours), as.character(config$first_crossing$max_hours_plot),
     unname(package_versions)
   )
 )
