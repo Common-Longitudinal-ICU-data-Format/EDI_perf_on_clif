@@ -33,3 +33,6 @@ output/intermediate_phi/*
 output/final_no_phi/*
 !output/final_no_phi/.gitkeep
 new_code_edi_analysis/
+local_reference/
+EDI old code/
+.superpowers/
